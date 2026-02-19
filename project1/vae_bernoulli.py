@@ -37,6 +37,101 @@ class GaussianPrior(nn.Module):
         prior: [torch.distributions.Distribution]
         """
         return td.Independent(td.Normal(loc=self.mean, scale=self.std), 1)
+    
+
+class MixtureGaussianPrior(nn.Module):
+    def __init__(self, M, n_components=10):
+        """
+        Define a mixture of Gaussian prior distribution.
+
+        Parameters:
+        M: [int] 
+           Dimension of the latent space.
+        n_components: [int]
+           Number of components in the mixture (default: 10).
+        """
+        super(MixtureGaussianPrior, self).__init__()
+        self.M = M
+        self.n_components = n_components
+
+        # Parameters for the mixture components
+        self.means = nn.Parameter(torch.randn(n_components, M))
+        self.stds = nn.Parameter(torch.ones(n_components, M))
+        self.logits = nn.Parameter(torch.ones(n_components))
+
+    def forward(self):
+        """
+        Return the prior distribution.
+
+        Returns:
+        prior: [torch.distributions.Distribution]
+        """
+        # Define the mixture components
+        components = td.Independent(td.Normal(self.means, self.stds), 1)
+        mixture = td.Categorical(logits=self.logits)
+
+        # Create a MixtureSameFamily distribution
+        return td.MixtureSameFamily(mixture, components)
+    
+
+class FlowBasedPrior(nn.Module):
+    def __init__(self, M, n_flows=4):
+        """
+        Define a flow-based prior distribution using a normalizing flow.
+
+        Parameters:
+        M: [int] 
+           Dimension of the latent space.
+        n_flows: [int]
+           Number of flow transformations (default: 4).
+        """
+        super(FlowBasedPrior, self).__init__()
+        self.M = M
+        self.n_flows = n_flows
+
+        # Base distribution (standard Gaussian)
+        self.base_dist = td.Independent(td.Normal(torch.zeros(M), torch.ones(M)), 1)
+
+        # Flow transformations (custom transformations)
+        self.flows = nn.ModuleList([self.AffineFlow(M) for _ in range(n_flows)])
+
+    class AffineFlow(nn.Module):
+        def __init__(self, M):
+            super().__init__()
+            self.scale = nn.Parameter(torch.randn(M))
+            self.shift = nn.Parameter(torch.randn(M))
+
+        def forward(self, z):
+            """
+            Apply the affine transformation.
+            """
+            x = self.scale * z + self.shift
+            log_det = torch.sum(torch.log(torch.abs(self.scale)))
+            return x, log_det
+
+        def inverse(self, x):
+            """
+            Apply the inverse affine transformation.
+            """
+            z = (x - self.shift) / self.scale
+            log_det = -torch.sum(torch.log(torch.abs(self.scale)))
+            return z, log_det
+
+    def forward(self):
+        """
+        Return the prior distribution.
+
+        Returns:
+        prior: [torch.distributions.TransformedDistribution]
+        """
+        z = self.base_dist.sample()
+        log_det_jacobian = 0
+
+        for flow in self.flows:
+            z, log_det = flow(z)
+            log_det_jacobian += log_det
+
+        return td.Independent(td.Normal(loc=z, scale=torch.ones_like(z)), 1)
 
 
 class GaussianEncoder(nn.Module):
@@ -124,7 +219,12 @@ class VAE(nn.Module):
         """
         q = self.encoder(x)
         z = q.rsample()
-        elbo = torch.mean(self.decoder(z).log_prob(x) - td.kl_divergence(q, self.prior()), dim=0)
+        
+        log_pz = self.prior().log_prob(z)
+        log_qz = q.log_prob(z)
+
+        # elbo = torch.mean(self.decoder(z).log_prob(x) - td.kl_divergence(q, self.prior()), dim=0)
+        elbo = torch.mean(self.decoder(z).log_prob(x) + log_pz - log_qz, dim=0)
         return elbo
 
     def sample(self, n_samples=1):
@@ -209,7 +309,7 @@ def evaluate_elbo_on_test_set(model, test_loader, device):
     return total_elbo / len(test_loader.dataset)
 
 
-def plot_aggregate_posterior(model, test_loader, device, num_components=2):
+def plot_aggregate_posterior(model, test_loader, device, n_components=2):
     """
     Plot samples from the approximate posterior and colour them by their correct class label.
 
@@ -220,7 +320,7 @@ def plot_aggregate_posterior(model, test_loader, device, num_components=2):
         DataLoader for the binarised MNIST test set.
     device: [torch.device]
         The device to run the evaluation on.
-    num_components: [int]
+    n_components: [int]
         Number of principal components to project onto (default: 2).
     """
     model.eval()
@@ -239,7 +339,7 @@ def plot_aggregate_posterior(model, test_loader, device, num_components=2):
     all_labels = np.concatenate(all_labels, axis=0)
 
     if all_z.shape[1] > 2:
-        pca = PCA(n_components=num_components)
+        pca = PCA(n_components=n_components)
         all_z = pca.fit_transform(all_z)
 
     plt.figure(figsize=(8, 8))
@@ -266,6 +366,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', type=int, default=32, metavar='N', help='batch size for training (default: %(default)s)')
     parser.add_argument('--epochs', type=int, default=10, metavar='N', help='number of epochs to train (default: %(default)s)')
     parser.add_argument('--latent-dim', type=int, default=32, metavar='N', help='dimension of latent variable (default: %(default)s)')
+    parser.add_argument('--prior', type=str, default='gaussian', choices=['gaussian', 'mixguassian', 'flow'], help='prior distribution (default: %(default)s)')
 
     args = parser.parse_args()
     print('# Options')
@@ -285,7 +386,13 @@ if __name__ == "__main__":
 
     # Define prior distribution
     M = args.latent_dim
-    prior = GaussianPrior(M)
+
+    if args.prior == 'gaussian':
+        prior = GaussianPrior(M)
+    elif args.prior == 'mixguassian':
+        prior = MixtureGaussianPrior(M, n_components=4)
+    elif args.prior == 'flow':
+        prior = FlowBasedPrior(M, n_flows=4)
 
     # Define encoder and decoder networks
     encoder_net = nn.Sequential(
@@ -336,4 +443,4 @@ if __name__ == "__main__":
     print(f"ELBO on test set: {elbo:.4f}")
 
     # Plot aggregate posterior
-    plot_aggregate_posterior(model, mnist_test_loader, device, num_components=2)
+    plot_aggregate_posterior(model, mnist_test_loader, device, n_components=2)
